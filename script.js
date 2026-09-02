@@ -1,23 +1,33 @@
 const {
-  consentFormId,
-  apiUrl,
+  preferenceFormId,
+  preferenceDetailsApiUrl,
+  preferenceHistoryApiUrl,
   submitApiUrl,
   signatureServiceUrl,
+  userToken,
   showButtons,
   showLanguageDropdown,
   enableCheckboxes,
   enableRadioButtons,
   enableDropdowns,
-  tenantToken,
+  footerAlignment = "left",
   customAttributes,
   receivedType,
   customHeaders
 } = window.consentWidgetConfig;
 
 let createConsentRequestList = [];
-let dataPrincipalIdList = [];
-let clickEvent = function () {};
+let selectedLanguage = "english";
+let storedSigning = { bss: null, bssPublicKey: null, sss: null };
+let pendingSignController = null;
+let currentSnapshot = null;
 let consentJwt = null;
+let clickEvent = async () => {};
+
+const AES_KEY_B64 = "el+1+epeGlCquCYLsk3zyQTsq3KUKQKL9QcV0B9KIS8=";
+let globalSSS = null;
+let isSSSValid = false;
+
 
 const urlParams = new URLSearchParams(window.location.search);
 
@@ -28,80 +38,6 @@ const campaignLinkContext = {
   ...(campaignId && { campaignId }),
   ...(linkToken && { linkToken })
 };
-
-
-function authHeaders() {
-  return {
-    "Content-Type": "application/json",
-    "Authorization-SDP": tenantToken || "",
-        ...customHeaders
-  };
-}
-
-
-async function handleApiResponse(res) {
-  let payload = {};
-
-  try {
-    payload = await res.json();
-  } catch (e) {
-    payload = {};
-  }
-
-  const apiMessage =
-    payload?.statusMessage ||
-    payload?.message ||
-    payload?.error?.message ||
-    payload?.error;
-
-  const isUnauthorized =
-    res.status === 401 ||
-    payload?.statusCode === 401;
-
-  if (isUnauthorized) {
-    const message = apiMessage || "401 UNAUTHORIZED";
-
-    showApiMessageOnly(message);
-
-    throw new Error(message);
-  }
-
-  // API returned an error HTTP status
-  if (!res.ok) {
-    const message =
-      apiMessage ||
-      `Request failed (${res.status})`;
-
-    showApiMessageOnly(message);
-
-    throw new Error(message);
-  }
-
-  return payload;
-}
-
-function showApiMessageOnly(message) {
-  const widgetContainer = document.querySelector(".widget-container");
-
-  if (!widgetContainer) return;
-
-  widgetContainer.innerHTML = "";
-
-  const error = document.createElement("div");
-  error.className = "error-only-message";
-  error.textContent = message || "";
-
-  widgetContainer.appendChild(error);
-}
-
-
-// ── IndexedDB helper ──
-let storedSigning = { bss: null, bssPublicKey: null, sss: null };
-let pendingSignController = null;
-let currentSnapshot = null;
-
-const AES_KEY_B64 = "el+1+epeGlCquCYLsk3zyQTsq3KUKQKL9QcV0B9KIS8=";
-let globalSSS = null;
 
 function uint8ToBase64(bytes) {
   const chunkSize = 0x8000;
@@ -116,7 +52,6 @@ function uint8ToBase64(bytes) {
 
   return btoa(binary);
 }
-
 async function encryptPayload(body) {
   const keyBytes = Uint8Array.from(atob(AES_KEY_B64), c => c.charCodeAt(0));
   const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, "AES-GCM", false, ["encrypt"]);
@@ -128,6 +63,16 @@ async function encryptPayload(body) {
   combined.set(new Uint8Array(cipher), iv.byteLength);
   return uint8ToBase64(combined);
 }
+
+function authHeaders() {
+  return {
+    "Content-Type": "application/json",
+    "Authorization-SDP": userToken || "",
+    ...customHeaders
+  };
+}
+
+// ── IndexedDB helper ──
 function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open("consent-signing-store", 2);
@@ -198,7 +143,7 @@ function canonicalizePayload(obj) {
   return JSON.stringify(obj);
 }
 
-// Signs the payload using ECDSA-P256; returns base64url IEEE P1363 signature.
+// Signs using ECDSA-P256; returns base64url IEEE P1363 signature.
 async function signPayload(payload) {
   try {
     const db = await openDB();
@@ -246,33 +191,117 @@ async function verifySSS(payload, sssBase64Url, pemPublicKey) {
       .replace(/-----END PUBLIC KEY-----/g, '')
       .replace(/\s+/g, '')
       .replace(/[^A-Za-z0-9+/=]/g, '');
-
-
-    while (b64.length % 4 !== 0) {
+    while (b64.length % 4 !== 0) { 
         b64 += '=';
-
-        }
+    }
     var der = Uint8Array.from(atob(b64), function(c) { return c.charCodeAt(0); });
     var pubKey = await crypto.subtle.importKey("spki", der, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
-
     var data = new TextEncoder().encode(canonicalizePayload(payload));
     var sigB64 = sssBase64Url.replace(/-/g, "+").replace(/_/g, "/");
     while (sigB64.length % 4) sigB64 += "=";
     var derBytes = Uint8Array.from(atob(sigB64), function(c) { return c.charCodeAt(0); });
-
     var p1363 = derToP1363(derBytes);
-
     var result = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, pubKey, p1363, data);
-
     return result;
   } catch (e) {
-    console.error("[SDP-SIGN] verifySSS: exception:", e);
     return false;
   }
 }
+function buildFinalConsentRequest(selectedLang) {
+  const requestList = [];
+  const consentDiv = document.getElementById("consent-root");
+
+  const allElements = consentDiv.querySelectorAll("[name]");
+
+  const pushConsent = (permissionId, optionId = null, hasValue = false) => {
+    let existing = requestList.find(r => r.permissionId === permissionId);
+
+    if (existing) {
+      if (hasValue) {
+        existing.optedForIndexes.push(parseInt(optionId));
+      }
+    } else {
+      requestList.push({
+        consentLanguage: selectedLang,
+        consentReceivedType: receivedType,
+        customAttributes,
+        permissionId,
+        optedForIndexes: hasValue ? [parseInt(optionId)] : []
+      });
+    }
+  };
+
+  allElements.forEach(el => {
+    const permissionId = el.name;
+
+    if (el.type === "checkbox" && enableCheckboxes) {
+      if (el.checked) {
+        pushConsent(permissionId, el.getAttribute("data-option-id") || "0", true);
+      } else {
+        pushConsent(permissionId, null, false);
+      }
+    }
+
+    else if (el.type === "radio" && enableRadioButtons) {
+      if (el.checked) {
+        pushConsent(permissionId, el.getAttribute("data-option-id") || "0", true);
+      } else {
+        // ensure permission exists even if nothing selected
+        pushConsent(permissionId, null, false);
+      }
+    }
+
+  else if (el.tagName === "SELECT" && enableDropdowns) {
+    const opt = el.options[el.selectedIndex];
+
+    if (opt && opt.value !== "") {
+      pushConsent(
+        permissionId,
+        opt.getAttribute("data-option-id") || "0",
+        true
+      );
+    } else {
+      pushConsent(permissionId, null, false);
+    }
+  }
+  });
+  
+  const msDropdowns = consentDiv.querySelectorAll(".ms-dropdown");
+  msDropdowns.forEach(ms => {
+    if (!enableDropdowns) return;
+    // Single-select dropdowns use a hidden <select>; handled by the [name] SELECT loop above.
+    if (ms.querySelector("select")) return;
+    const permId = ms.getAttribute("data-perm-id");
+    const checkedBoxes = ms.querySelectorAll('input[type="checkbox"]:checked');
+    if (checkedBoxes.length > 0) {
+      checkedBoxes.forEach(cb => {
+        pushConsent(permId, cb.getAttribute("data-option-id") || "0", true);
+      });
+    } else {
+      pushConsent(permId, null, false);
+    }
+  });
+
+requestList.sort((a, b) =>
+  String(a.permissionId).localeCompare(String(b.permissionId))
+);
+
+const normalizedList = requestList.map(item => {
+  const sortedItem = {};
+  Object.keys(item)
+    .sort()
+    .forEach(key => {
+      sortedItem[key] = item[key];
+    });
+  return sortedItem;
+});
+
+return {
+  createConsentRequestDtoWrapper: normalizedList
+};
+}
 
 // Called on every radio/checkbox/dropdown change.
-// Generates BSS, calls sdp-consent-signature, verifies SSS, stores result.
 async function onSelectionChange(selectedLang) {
 
   const request = buildFinalConsentRequest(selectedLang);
@@ -281,13 +310,14 @@ async function onSelectionChange(selectedLang) {
   currentSnapshot = request;
   var bssPublicKey = await getPublicKeyB64();
   var bss = await signPayload(currentSnapshot.createConsentRequestDtoWrapper);
-  if (!bss || !bssPublicKey) { console.warn("[SDP-SIGN] onSelectionChange: BSS generation failed"); return; }
+  if (!bss || !bssPublicKey) {
+   return; }
 
   try {
     var headers = { "Content-Type": "application/json" };
     var res = await fetch(signatureServiceUrl + "/v1/sign", {
       method: "POST",
-  headers: headers,
+      headers: headers,
       body: JSON.stringify({ payload: currentSnapshot.createConsentRequestDtoWrapper, bss: bss, bss_pkey: bssPublicKey })
     });
     if (!res.ok) {
@@ -299,244 +329,452 @@ async function onSelectionChange(selectedLang) {
       else if (signErr?.error?.code === "BSS_VERIFICATION_FAILED") showToast(" BSS authentication failed", "error");
       else if (signErr?.error?.code === "SSS_VERIFICATION_FAILED") showToast(" SSS authentication failed", "error");
       else showToast(" Signature service failed", "error");
-      console.warn("[SDP-SIGN] Signature service returned", res.status);
       return;
     }
     var signData = await res.json();
     var sss = signData.sss;
     globalSSS = sss;
-    
+	
     // Verify against currentSnapshot (latest) — if user changed selection while
-    //this request was in-flight, currentSnapshot !== snapshot and verification fails.
+    // this request was in-flight, currentSnapshot !== snapshot and verification fails.
     var valid = await verifySSS(currentSnapshot.createConsentRequestDtoWrapper, sss, signData.sss_pkey);
 
     const submitBtn = document.getElementById("submitBtn");
     if (valid) {
       //storedSigning = { bss: bss, bssPublicKey: bssPublicKey, sss: sss };
+      isSSSValid = true;
       if (submitBtn) submitBtn.disabled = false;
     } else {
+      isSSSValid = false;
       if (submitBtn) submitBtn.disabled = true;
     }
   } catch (e) {
     console.error("[SDP-SIGN] Signature service call failed:", e);
-    showToast("Signature service unavailable", "error");
+    showToast("v1/sign service unavailable", "error");
   }
 }
 
+async function handleApiResponse(res) {
+  let payload = {};
 
-function buildFinalConsentRequest(selectedLang) {
-  setDataPrincipalIdList();
-
-  const requestList = [];
-  const consentDiv = document.getElementById("consent-root");
-
-    consentDiv.querySelectorAll(".permission-block").forEach(block => {
-
-      const permissionNode = block.querySelector("[data-translate-text]");
-      const permissionId = permissionNode && permissionNode.getAttribute("data-translate-text");
-
-      if (!permissionId) {
-          return;
-      }
-
-      requestList.push({
-          consentLanguage: selectedLang,
-          consentReceivedType: receivedType,
-          customAttributes,
-          dataPrincipalIdList,
-          permissionId,
-          optedForIndexes: []
-      });
-  });
-
-  const checkedCheckboxes = Array.from(consentDiv.querySelectorAll('input[type="checkbox"]:checked'));
-  const regularCheckboxes = checkedCheckboxes.filter(cb => !cb.closest(".ms-dropdown"));
-  const multiselectCheckboxes = checkedCheckboxes.filter(cb => cb.closest(".ms-dropdown"));
-  const radioButtons = consentDiv.querySelectorAll('input[type="radio"]:checked');
-  const dropdowns = consentDiv.querySelectorAll("select");
-
-  const pushConsent = (permissionId, optionId) => {
-    let existing = requestList.find(r => r.permissionId === permissionId);
-
-    if (existing) {
-      existing.optedForIndexes.push(parseInt(optionId));
-    } else {
-      requestList.push({
-        consentLanguage: selectedLang,
-        consentReceivedType: receivedType,
-        customAttributes,
-        dataPrincipalIdList,
-        permissionId,
-        optedForIndexes: [parseInt(optionId)]
-      });
-    }
-  };
-
-  regularCheckboxes.forEach(cb => {
-    if (!enableCheckboxes) return;
-    if (!cb.name) return;
-    pushConsent(cb.name, cb.getAttribute("data-option-id") || "0");
-  });
-
-  multiselectCheckboxes.forEach(cb => {
-    if (!enableDropdowns) return;
-
-    const msDropdown = cb.closest(".ms-dropdown");
-    const permId = msDropdown && msDropdown.getAttribute("data-perm-id");
-    const optionId = cb.getAttribute("data-option-id");
-
-    if (!permId || optionId === null) return;
-    pushConsent(permId, optionId);
-  });
-
-  radioButtons.forEach(rb => {
-    if (!enableRadioButtons) return;
-    pushConsent(rb.name, rb.getAttribute("data-option-id") || "0");
-  });
-
-
-  dropdowns.forEach(sel => {
-    if (!enableDropdowns) return;
-
-    // Skip "Select options"
-    if (!sel.value) return;
-
-    const opt = sel.options[sel.selectedIndex];
-    const optionId = opt.getAttribute("data-option-id");
-
-    if (optionId !== null) {
-      pushConsent(sel.name, optionId);
-    }
-  });
-
-  return {
-    createConsentRequestDtoWrapper: requestList
-  };
-}
- 
-
-async function fetchConsentData(selectedLang) {
   try {
-    const body = { consentFormId, ...campaignLinkContext};
-    const publicKey = await getPublicKeyB64();
-    if (publicKey) body.bssk = publicKey;
-    const browserSignature = await signPayload({ consentFormId });
+    payload = await res.json();
+  } catch (e) {
+    payload = {};
+  }
 
-    const res = await fetch(apiUrl, {
-      method: "POST",
-      headers: authHeaders(),
-      credentials: "include",
-      body: JSON.stringify(body)
-    });
+  const apiMessage =
+    payload?.statusMessage ||
+    payload?.message ||
+    payload?.error;
 
-    const result = await handleApiResponse(res);
+  // 401
+  if (res.status === 401 || payload?.statusCode === 401) {
+    showErrorOnly(apiMessage || "401 UNAUTHORIZED");
+    throw new Error(apiMessage || "UNAUTHORIZED");
+  }
 
-    consentJwt = result.response.payload;
-    const decoded = decodeJwt(consentJwt);
-	  
-    const payloadEncryptionEnabled = decoded.data.response.payloadEncryptionEnabled;
-    window.payloadEncryptionEnabled = payloadEncryptionEnabled;
-    
-    const data =
-      decoded?.data?.response?.data?.response?.[0] ||
-      decoded?.data?.response?.[0] ||
-      decoded?.response?.[0];
+  // Any API error
+  if (!res.ok) {
+    const msg = apiMessage || `Request failed (${res.status})`;
 
-    if (!data) {
-      document.getElementById("consent-root").innerText =
-        "Consent data not found.";
-      return;
-    }
+    showErrorOnly(msg);
+    throw new Error(msg);
+  }
 
-    // IMPORTANT: always re-render using selectedLang
-    const lang =
-        selectedLang?.toLowerCase() ||
-        data.languages?.[0]?.toLowerCase() ||
-        "en";
+  return payload;
+}
 
-    renderConsent(data, lang);
+function showErrorOnly(message) {
+  const widgetContainer = document.querySelector(".widget-container");
 
-    // Trigger initial signing so Submit button is enabled on page load
-    await onSelectionChange(lang);
-} catch (e) {
-  const message = e?.message;
+  if (!widgetContainer) return;
 
-  if (message) {
-    showApiMessageOnly(message);
+  // Remove the existing UI
+  widgetContainer.innerHTML = "";
+
+  // Show only the API message
+  const error = document.createElement("div");
+  error.className = "error-only-message";
+  error.textContent = message;
+
+  widgetContainer.appendChild(error);
+}
+
+
+
+function setFormDisabled(disabled = true) {
+  const root = document.getElementById("consent-root");
+  const inputs = root.querySelectorAll("input, select, textarea, button");
+  inputs.forEach(input => input.disabled = disabled);
+
+  const submitBtn = document.getElementById("submitBtn");
+  const cancelBtn = document.getElementById("cancelBtn");
+  
+  if (disabled) {
+    submitBtn.classList.add("loading");
+  } else {
+    submitBtn.classList.remove("loading");
   }
 }
+
+const historyPagination = {
+  page: 0,
+  size: 10,
+  hasMore: true,
+  loading: false
+};
+
+const SCROLL_THRESHOLD = 180; 
+function attachHistoryScroll() {
+  const scrollContainer = document.querySelector(".preview-statements");
+
+  if (!scrollContainer || scrollContainer.dataset.scrollBound) return;
+
+  scrollContainer.addEventListener("scroll", () => {
+    if (
+      scrollContainer.scrollTop + scrollContainer.clientHeight >=
+      scrollContainer.scrollHeight - SCROLL_THRESHOLD
+    ) {
+      loadMoreHistory();
+    }
+  });
+
+  scrollContainer.dataset.scrollBound = "true";
 }
+
+
+async function loadMoreHistory() {
+  if (!historyPagination.hasMore || historyPagination.loading) return;
+
+  historyPagination.loading = true;
+  historyPagination.failed = false;;
+
+  try {
+    const scrollPayload = {
+      preferenceFormId,
+      page: historyPagination.page + 1,
+      pageSize: historyPagination.size,
+      sortBy: "formName",
+      sortDirection: "ASC"
+    };
+    const browserSignature = await signPayload(scrollPayload);
+    if (browserSignature) scrollPayload.bss = browserSignature;
+
+ const res = await fetch(preferenceHistoryApiUrl, {
+  method: "POST",
+  headers: authHeaders(),
+  credentials: "include",
+  body: JSON.stringify({ ...scrollPayload, ...campaignLinkContext })
+});
+
+
+   const result = await handleApiResponse(res);
+   const response = result.response;
+
+  if (!response || !response.preferenceHistoryByTimeStamp) {
+    historyPagination.hasMore = false;
+    return;
+  }
+    Object.entries(response.preferenceHistoryByTimeStamp || {}).forEach(
+      ([timestamp, list]) => {
+        if (!window.preferenceHistory[timestamp]) {
+          window.preferenceHistory[timestamp] = [];
+        }
+        window.preferenceHistory[timestamp].push(...list);
+      }
+    );
+
+    historyPagination.page = response.page;
+    historyPagination.hasMore = response.hasMore;
+
+    renderHistory(window.preferenceHistory);
+  } catch (e) {
+    console.error("History scroll failed", e);
+
+    // STOP infinite retry loop
+    historyPagination.hasMore = false;
+    historyPagination.failed = true;
+
+  } finally {
+    historyPagination.loading = false;
+  }
+}
+
 
 document.addEventListener("DOMContentLoaded", () => {
   const container = document.querySelector(".widget-container");
-
-  if (!container) return;
-
   Array.from(container.children).forEach((child) => {
     if (!child.classList.contains("preview-statements")) {
-      child.style.display = "none";
+      child.style.display = "none"; 
     }
   });
 
   const consentRoot = document.getElementById("consent-root");
-
-  if (consentRoot) {
-    consentRoot.innerText = "Loading...";
-  }
+  consentRoot.innerText = "Loading...";
 });
 
 
-function setDataPrincipalIdList() {
-  dataPrincipalIdList = [];
-  const { dataPrincipalId } = window.consentWidgetConfig || {};
-  if (Array.isArray(dataPrincipalId)) {
-    dataPrincipalId.forEach(({ key, value }) => {
-      if (key && value) {
-        dataPrincipalIdList.push({ key, value });
-      }
+function getSelectedByPosition(perm, selectedLang) {
+  if (!perm.optedFor?.length || !perm.permissionTranslation) return [];
+
+  const baseTr = perm.permissionTranslation[0];
+  const targetTr = perm.permissionTranslation.find(
+    pt => pt.language?.toLowerCase() === selectedLang
+  );
+
+  if (!baseTr?.options || !targetTr?.options) return [];
+
+  return perm.optedFor
+    .map(value => {
+      const idx = baseTr.options.indexOf(value);
+      return idx >= 0 ? targetTr.options[idx] : null;
+    })
+    .filter(Boolean);
+}
+
+
+function renderLanguageDropdown(data) {
+  const langWrapper = document.getElementById("language-wrapper");
+  const langSelect = document.getElementById("langSelect");
+
+  const languages = (data.languages || []).map(l => l.toLowerCase());
+
+  if (!showLanguageDropdown || languages.length === 0) {
+    langWrapper.style.display = "none";
+    return;
+  }
+
+  langWrapper.style.display = "block";
+  langSelect.innerHTML = "";
+  selectedLanguage = selectedLanguage || languages[0];
+
+  languages.forEach(lang => {
+    const opt = document.createElement("option");
+    opt.value = lang;
+    opt.text = lang.toUpperCase();
+    if (lang === selectedLanguage) opt.selected = true;
+    langSelect.appendChild(opt);
+  });
+
+	langSelect.onchange = async () => {
+	  selectedLanguage = langSelect.value;
+
+	  const request = buildFinalConsentRequest(selectedLanguage);
+
+	  if (window.preferenceData?.currentPreference) {
+		renderConsent(window.preferenceData, selectedLanguage);
+	  }
+
+	  if (!document.getElementById("historyTab").classList.contains("hidden")) {
+		renderHistory(window.preferenceHistory, selectedLanguage);
+	  }
+
+	  await onSelectionChange(selectedLanguage, request);
+	};
+}
+
+
+async function fetchConsentData() {
+  try {
+    const publicKey = await getPublicKeyB64();
+    const browserSignature = await signPayload({ preferenceFormId });
+    const baseBody = {
+      preferenceFormId,
+      page: 0,
+      pageSize: 10,
+      sortBy: "formName",
+      sortDirection: "ASC"
+    };
+    if (publicKey) baseBody.bssk = publicKey;
+    const res = await fetch(preferenceDetailsApiUrl, {
+      method: "POST",
+      headers: authHeaders(),
+      credentials: "include",
+      body: JSON.stringify({ ...baseBody, ...campaignLinkContext })
+    });
+
+const result = await handleApiResponse(res);
+consentJwt = result.response.payload;
+// decode JWT response
+const decoded = decodeJwt(result.response.payload);
+
+const payloadEncryptionEnabled = decoded.data.response.payloadEncryptionEnabled;
+window.payloadEncryptionEnabled = payloadEncryptionEnabled;
+
+const data = decoded?.data?.response?.data;
+
+// NEW LINES YOU NEED TO ADD:
+const sssk = decoded.sssk;
+const bssk = decoded.bssk;
+const nonce = decoded.nonce;
+
+window.preferenceHistory = data.preferenceHistoryAgainstTimeStamp?.preferenceHistoryByTimeStamp || {};
+if (data.currentPreference) {
+  data.currentPreference.permissions =
+    (data.currentPreference.permissions || [])
+      .map(p => ({ ...p }))
+      .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+}
+
+window.preferenceData = data;
+ if (data.golabalFontFamily) {
+  const fontFamily = data.golabalFontFamily;
+  if (!document.getElementById("consent-global-font")) {
+    const style = document.createElement("style");
+    style.id = "consent-global-font";
+    style.innerHTML = `
+      .widget-container input,
+      .widget-container select,
+      .widget-container textarea,
+      .widget-container button,
+  `;
+    document.head.appendChild(style);
+  }
+}
+
+// keep previously selected language after submit
+selectedLanguage = selectedLanguage || data.languages?.[0]?.toLowerCase() || "englis";
+renderLanguageDropdown(data);
+handlePreferenceView(data.preferenceView);
+if (data.currentPreference) {
+  renderConsent(data, selectedLanguage);
+    setTimeout(() => {
+  onSelectionChange(selectedLanguage);
+}, 0);
+}
+
+renderConsent(data, selectedLanguage);
+    const container = document.querySelector(".widget-container");
+    Array.from(container.children).forEach((child) => {
+      child.style.display = "";
+    });
+
+} catch (e) {
+  console.error("[CONSENT-WIDGET] fetchConsentData failed:", e);
+
+  const consentRoot = document.getElementById("consent-root");
+
+  consentRoot.innerText =
+    e?.message || "Failed to load preference data.";
+
+  const container = document.querySelector(".widget-container");
+
+  if (container) {
+    Array.from(container.children).forEach((child) => {
+      child.style.display = "";
     });
   }
 }
 
+}
+
 function showToast(message, type) {
   const toast = document.getElementById("toast");
-  if (!toast) return;
 
   toast.textContent = message;
   toast.style.backgroundColor =
     type === "success" ? "#4CAF50" : "#f44336";
 
-  toast.style.visibility = "visible";
-  toast.classList.remove("show"); 
-  void toast.offsetHeight;        
   toast.classList.add("show");
-
   setTimeout(() => {
     toast.classList.remove("show");
-    toast.style.visibility = "hidden";
-  }, 3000);
+  }, 2000);
 }
+
 
 function getFormValues(selectedLang) {
-  const finalPayload = buildFinalConsentRequest(selectedLang);
-  createConsentRequestList = finalPayload.createConsentRequestDtoWrapper;
+  createConsentRequestList = [];
+
+  const consentDiv = document.getElementById("consent-root");
+  const checkboxes = consentDiv.querySelectorAll('input[type="checkbox"]:checked');
+  const radioButtons = consentDiv.querySelectorAll('input[type="radio"]:checked');
+  const dropdowns = consentDiv.querySelectorAll("select");
+
+  const pushConsent = (permissionId, optionId) => {
+    let existing = createConsentRequestList.find(req => req.permissionId === permissionId);
+    if (existing) {
+      existing.optedForIndexes.push(parseInt(optionId));
+    } else {
+      createConsentRequestList.push({
+        permissionId,
+        customAttributes,
+        consentReceivedType: receivedType,
+        optedForIndexes: [parseInt(optionId)],
+        consentLanguage: selectedLang
+      });
+    }
+  };
+
+  checkboxes.forEach(checkbox => {
+    if (!enableCheckboxes) return;
+    const optionId = checkbox.getAttribute("data-option-id") || "0";
+    pushConsent(checkbox.name, optionId);
+  });
+
+  radioButtons.forEach(radio => {
+    if (!enableRadioButtons) return;
+    const optionId = radio.getAttribute("data-option-id") || "0";
+    pushConsent(radio.name, optionId);
+  });
+
+
+ dropdowns.forEach(drop => {
+    if (!enableDropdowns) return;
+
+    const selected = drop.options[drop.selectedIndex];
+
+    // Skip unselected dropdown
+    if (!selected || !selected.value) return;
+
+    const optionId = selected.getAttribute("data-option-id") || "0";
+    pushConsent(drop.name, optionId);
+  });
+
+  document.querySelectorAll("#consent-root .ms-dropdown").forEach(ms => {
+    if (!enableDropdowns) return;
+    const permId = ms.getAttribute("data-perm-id");
+    const checkedBoxes = ms.querySelectorAll('input[type="checkbox"]:checked');
+    checkedBoxes.forEach(cb => {
+      const optionId = cb.getAttribute("data-option-id") || "0";
+      pushConsent(permId, optionId);
+    });
+  });
+
+  document.querySelectorAll("#consent-root [name]").forEach(el => {
+    if (el.tagName === "SELECT") {
+      return;
+    }
+    if (!createConsentRequestList.some(req => req.permissionId === el.name)) {
+      createConsentRequestList.push({
+        customAttributes,
+        permissionId: el.name,
+        consentReceivedType: receivedType,
+        optedForIndexes: [],
+        consentLanguage: selectedLang
+      });
+    }
+  });
+
   sendConsent();
 }
-
+  
 async function sendConsent() {
-  //setFormDisabled(true);
+  setFormDisabled(true);
   try {
-    
-    const body = {createConsentRequestDtoWrapper: createConsentRequestList,...campaignLinkContext};
+    createConsentRequestList.sort((a, b) =>
+  String(a.permissionId).localeCompare(String(b.permissionId))
+);
+    const body = { createConsentRequestDtoWrapper: createConsentRequestList };
     if (storedSigning.bss) {
-      body.bss = storedSigning.bss;
+      body.bss = await signPayload(createConsentRequestList);
       body.sss = globalSSS;
-      body.jwt = consentJwt;
+      body.jwt=consentJwt;
     } else {
       const browserSignature = await signPayload(createConsentRequestList);
       if (browserSignature) body.bss = browserSignature;
-        body.sss =globalSSS ;
-	      body.jwt = consentJwt;
+      body.sss = globalSSS;
+      body.jwt=consentJwt;
     }
 
     let requestBody;
@@ -567,29 +805,22 @@ async function sendConsent() {
     } catch (e) {
       console.error("Storage failed:", e);
     }
-
     if (data.response && data.statusCode === 200) {
-    showToast("Consent saved successfully!", "success");
-
-    await new Promise(resolve => setTimeout(resolve, 3000));
-
-    const langSelect = document.getElementById("langSelect");
-    const selectedLang =
-      langSelect?.value ||
-      document.documentElement.lang ||
-      "en";
-
-    await fetchConsentData(selectedLang);
-
-    return data;
-}
-
-
+      showToast("Consent saved successfully!", "success");
+	   setFormDisabled(false)
+     await new Promise(resolve => setTimeout(resolve, 3000));
+	   fetchConsentData()
+     return data;
+    } else {
+      showToast(data.statusMessage || "Something went wrong.", "error");
+      setFormDisabled(false);
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      fetchConsentData()
+    }
   } catch (err) {
     console.error(err);
     showToast("Failed to submit. Please check your network connection.", "error");
-    throw err;
-
+    setFormDisabled(false);
   } finally {
     // Send response to Android WebView if available
     if (typeof window.AndroidBridge !== 'undefined' && 
@@ -600,81 +831,47 @@ async function sendConsent() {
         console.error('Failed to send response to Android:', error);
       }
     }
-    setFormDisabled(false);
   }
 }
 
-function resetWidget(reSign = false) {
-  const root = document.getElementById("consent-root");
 
-  const inputs = root.querySelectorAll("input, select, textarea");
-  inputs.forEach(el => {
-    if (el.type === "checkbox" || el.type === "radio") {
-      el.checked = false;
-    } else {
-      el.value = "";
-    }
-  });
 
-  root.querySelectorAll(".ms-dropdown").forEach(ms => {
-    const chips = ms.querySelector(".ms-chips");
-    const placeholder = ms.querySelector(".ms-placeholder");
-    if (chips) chips.innerHTML = "";
-    if (placeholder) placeholder.style.display = "inline";
-  });
+function isOptionSelected(perm, optionId, baseValue) {
 
-  const submitBtn = document.getElementById("submitBtn");
-  if (submitBtn) submitBtn.disabled = true;
-
-  currentSnapshot = null;
-  createConsentRequestList = [];
-  globalSSS = null;
-
-  if (reSign) {
-    const langSelect = document.getElementById("langSelect");
-    if (langSelect) {
-      onSelectionChange(langSelect.value);
-    }
+  if (Array.isArray(perm.optedFor)) {
+    return perm.optedFor.includes(baseValue);
   }
+
+  if (perm.optedFor && typeof perm.optedFor === "object") {
+    return !!perm.optedFor[optionId];
+  }
+
+  return false;
 }
 
-function setFormDisabled(disabled = true) {
-  const root = document.getElementById("consent-root");
-  const inputs = root.querySelectorAll("input, select, textarea, button");
-  inputs.forEach(input => input.disabled = disabled);
+function isMandatoryField(perm) {
+  const mandatoryValue = perm?.mandatory;
 
-  const submitBtn = document.getElementById("submitBtn");
-  const cancelBtn = document.getElementById("cancelBtn");
-  
-  if (disabled) {
-    submitBtn.classList.add("loading");
-  } else {
-    submitBtn.classList.remove("loading");
+  if (typeof mandatoryValue === "boolean") return mandatoryValue;
+  if (typeof mandatoryValue === "number") return mandatoryValue === 1;
+  if (typeof mandatoryValue === "string") {
+    const normalized = mandatoryValue.trim().toLowerCase();
+    return normalized === "true" || normalized === "1" || normalized === "yes";
   }
+
+  return false;
 }
+
 
 function renderConsent(data, selectedLang) {
-
-  // Show widget after successful API response
-  const container = document.querySelector(".widget-container");
-
-  if (container) {
-    Array.from(container.children).forEach((child) => {
-      child.style.display = "";
-    });
-  }
-
   const root = document.getElementById("consent-root");
-  root.replaceChildren();
+  root.innerHTML = "";
 
-  const branding = data.branding || {};
+  const errorDiv = document.getElementById("error-message");
+  errorDiv.innerHTML = "";
 
-  let permissions = [];
-  if (Array.isArray(data.consentForm)) {
-    permissions = data.consentForm.flatMap(cf => cf.permissions || []);
-  } else if (Array.isArray(data.permissions)) {
-    permissions = data.permissions;
-  }
+  const branding = data.currentPreference?.branding || {};
+  const permissions = data.currentPreference?.permissions || [];
 
   const logoArea = document.getElementById("logo-area");
   logoArea.innerHTML = "";
@@ -689,7 +886,7 @@ function renderConsent(data, selectedLang) {
   if (align === "center") {
     wrapper.style.flexDirection = "column";
   } else if (align === "right") {
-    wrapper.style.flexDirection = "row-reverse"; 
+    wrapper.style.flexDirection = "row-reverse";
   } else {
     wrapper.style.flexDirection = "row";
   }
@@ -712,30 +909,27 @@ function renderConsent(data, selectedLang) {
     nameDiv.innerText = branding.companyName;
     nameDiv.classList.add("company-name");
 
-    if (branding.headerFontColor) nameDiv.style.color = branding.headerFontColor;
-    if (branding.headerFontFamily) nameDiv.style.fontFamily = branding.headerFontFamily;
+    if (branding.headerFontColor)
+      nameDiv.style.color = branding.headerFontColor;
+    if (branding.headerFontFamily)
+      nameDiv.style.fontFamily = branding.headerFontFamily;
     if (branding.headerFontSize) {
-      const sizeMap = { small: "14px", medium: "16px", large: "20px" };
-      const sz = String(branding.headerFontSize).toLowerCase();
-      nameDiv.style.fontSize = sizeMap[sz] || branding.headerFontSize;
+      const sizeMap = {
+        small: "14px",
+        medium: "16px",
+        large: "20px",
+      };
+      const sz = branding.headerFontSize.toLowerCase();
+      nameDiv.style.fontSize =
+        sizeMap[sz] || branding.headerFontSize;
     }
     if (branding.headerFontStyle) {
-      const styleLower = String(branding.headerFontStyle).toLowerCase();
-      if (styleLower.includes("italic")) nameDiv.style.fontStyle = "italic";
-      if (styleLower.includes("bold")) nameDiv.style.fontWeight = "bold";
-      if (styleLower.includes("normal")) {
-        nameDiv.style.fontStyle = "normal";
-        nameDiv.style.fontWeight = "400";
-      }
-    }
-
-    if (branding.companySubtitle) {
-      const subEl = document.createElement("div");
-      subEl.className = "company-subtitle";
-      subEl.innerText = branding.companySubtitle;
-      if (branding.subtitleFontSize) subEl.style.fontSize = branding.subtitleFontSize;
-      if (branding.subtitleFontColor) subEl.style.color = branding.subtitleFontColor;
-      nameDiv.appendChild(subEl);
+      const styleLower =
+        branding.headerFontStyle.toLowerCase();
+      if (styleLower.includes("italic"))
+        nameDiv.style.fontStyle = "italic";
+      if (styleLower.includes("bold"))
+        nameDiv.style.fontWeight = "bold";
     }
 
     wrapper.appendChild(nameDiv);
@@ -743,411 +937,396 @@ function renderConsent(data, selectedLang) {
 
   logoArea.appendChild(wrapper);
 
-  const langWrapper = document.getElementById("language-wrapper");
-  const langSelect = document.getElementById("langSelect");
-  if (showLanguageDropdown && data.languages?.length >= 1) {
-    langWrapper.style.display = "block";
-    langSelect.innerHTML = "";
-    data.languages.forEach(lang => {
-      const opt = document.createElement("option");
-      opt.value = lang.toLowerCase();
-      opt.text = lang;
-      if (opt.value === selectedLang) opt.selected = true;
-      langSelect.appendChild(opt);
-    });
-langSelect.onchange = async () => {
-  const newLang = langSelect.value;
-
-  setFormDisabled(true);   // instead of clearing DOM
-
-  await fetchConsentData(newLang);
-
-  setFormDisabled(false);
-};
- } else {
-    langWrapper.style.display = "none";
-  }
-
+ 
   if (!permissions.length) {
     root.innerHTML = "<p>No consent items found.</p>";
     return;
   }
-  permissions.forEach(perm => {
-    const block = document.createElement("div");
-    block.className = "permission-block";
 
-    const tr = perm.permissionTranslation?.find(pt => pt.language.toLowerCase() === selectedLang);
-    const htmlString = (tr?.text || perm.text || "").trim();
+  permissions.forEach((perm) => {
+  const block = document.createElement("div");
+  block.className = "permission-block";
+  block.setAttribute("data-permission-id", String(perm.id));
 
-    const tempDiv = document.createElement("div");
-    tempDiv.innerHTML = htmlString;
+  const tr = perm.permissionTranslation?.find(
+    (pt) => pt.language.toLowerCase() === selectedLang
+  );
 
-    const children = Array.from(tempDiv.children);
+  const htmlString = tr?.text || perm.text || "";
+  const tempDiv = document.createElement("div");
+  tempDiv.innerHTML = htmlString;
 
-      if (children.length > 0) {
-        children.forEach((child, index) => {
-          const el = document.createElement(child.tagName.toLowerCase());
-          el.innerHTML = child.innerHTML;
+  const children = Array.from(tempDiv.children);
 
-          if (child.getAttribute("style")) {
-            el.setAttribute("style", child.getAttribute("style"));
-          }
+  if (children.length > 0) {
+    children.forEach((child) => {
+      const el = document.createElement(child.tagName.toLowerCase());
+      el.innerHTML = child.innerHTML;
 
-          if (
-            /^h[1-6]$/i.test(child.tagName) &&
-            !/font-weight/i.test(child.getAttribute("style") || "")
-          ) {
-            el.style.fontWeight = "normal";
-          }
+      if (child.getAttribute("style")) {
+        el.setAttribute("style", child.getAttribute("style"));
+      }
 
-          el.style.display = "block";
-          el.style.lineHeight = "1";
+      el.style.display = "block";
+      el.style.lineHeight = "1";
 
-          // Preserve paragraph spacing and explicit blank lines from editor content.
-          if (child.tagName.toLowerCase() === "p") {
-            const normalized = (child.innerHTML || "").replace(/&nbsp;/g, "").trim().toLowerCase();
-            const childText = (child.textContent || "").trim();
-            const isBlankParagraph =
-              !childText &&
-              (normalized === "" || normalized === "<br>" || normalized === "<br/>" || normalized === "<br />");
+      // Preserve paragraph spacing and explicit blank lines from editor content.
+      if (child.tagName.toLowerCase() === "p") {
+        const normalized = (child.innerHTML || "").replace(/&nbsp;/g, "").trim().toLowerCase();
+        const childText = (child.textContent || "").trim();
+        const isBlankParagraph =
+          !childText &&
+          (normalized === "" || normalized === "<br>" || normalized === "<br/>" || normalized === "<br />");
 
-            el.style.margin = "0 0 5px 0";
-            el.style.minHeight = "1em";
-            if (isBlankParagraph) {
-              el.innerHTML = "&nbsp;";
-            }
-          } else {
-            el.style.margin = "2px 0";
-          }
-
-          el.setAttribute("data-translate-text", perm.id);
-
-          if (perm.mandatory && index === children.length - 1) {
-                el.innerHTML += ' <span class="mandatory">*</span>';
-          }
-
-          block.appendChild(el);
-        });
+        el.style.margin = "0 0 5px 0";
+        el.style.minHeight = "1em";
+        if (isBlankParagraph) {
+          el.innerHTML = "&nbsp;";
+        }
       } else {
-        const p = document.createElement("p");
-        p.textContent = htmlString.replace(/<[^>]*>/g, "");
-        p.style.whiteSpace = "pre-wrap";
-        p.style.margin = "0 0 5px 0";
-        p.style.lineHeight = "1";
-        p.setAttribute("data-translate-text", perm.id);
-
-        if (perm.mandatory) {
-          p.innerHTML += ' <span class="mandatory">*</span>';
-        }
-
-        block.appendChild(p);
+        el.style.margin = "2px 0";
       }
 
-      const optionMap = perm.optionsMap || {};
-      const options = tr?.options || perm.options || [];
-      const hasOptionMap = Object.keys(optionMap).length > 0;
+      block.appendChild(el);
+    });
 
-      if (perm.elementType === 'CHECKBOX' && enableCheckboxes) {
-        if (hasOptionMap) {
-            const mapEntries = Object.entries(optionMap);
-            const translatedOptions = tr?.options || [];
-
-            mapEntries.forEach(([id, baseLabel], index) => {
-
-              const label = translatedOptions[index] || baseLabel;
-
-              const labelEl = document.createElement("label");
-              const input = document.createElement("input");
-
-              input.type = "checkbox";
-              input.name = perm.id;
-              input.value = baseLabel;
-              input.setAttribute("data-option-id", id);
-
-              labelEl.appendChild(input);
-              labelEl.append(" " + label);
-
-              block.appendChild(labelEl);
-            });
-        } else {
-          options.forEach((opt, idx) => {
-            const labelEl = document.createElement("label");
-            const input = document.createElement("input");
-            input.type = "checkbox";
-            input.name = perm.id;
-            input.value = opt;
-            input.setAttribute("data-option-id", idx.toString());
-            labelEl.appendChild(input);
-            labelEl.append(" " + opt);
-            block.appendChild(labelEl);
-          });
-        }
+    if (isMandatoryField(perm)) {
+      const lastChild = block.lastChild;
+      if (lastChild && lastChild instanceof HTMLElement) {
+        lastChild.innerHTML += ' <span class="mandatory">*</span>';
       }
+    }
+  } else {
+    const p = document.createElement("p");
+    p.textContent = htmlString.replace(/<[^>]*>/g, "");
+    p.style.whiteSpace = "pre-wrap";
+    p.style.margin = "0 0 5px 0";
+    p.style.lineHeight = "1";
 
-      if (perm.elementType === 'RADIOBUTTON' && enableRadioButtons) {
-        if (hasOptionMap) {
-            const mapEntries = Object.entries(optionMap);
-            const translatedOptions = tr?.options || [];
+    if (isMandatoryField(perm)) {
+      p.innerHTML += ' <span class="mandatory">*</span>';
+    }
 
-            mapEntries.forEach(([id, baseLabel], index) => {
+    block.appendChild(p);
+  }
+  const options = tr?.options || perm.options || [];
+  const optionMap = perm.optionsMap || {};
 
-              const label = translatedOptions[index] || baseLabel;
+  if (perm.elementType === "CHECKBOX" && enableCheckboxes) {
+    if (Object.keys(optionMap).length > 0) {
+      const mapEntries = Object.entries(optionMap);
+      const translatedOptions = tr?.options || perm.options || [];
+      mapEntries.forEach(([id, baseValue], index) => {
+        const displayLabel = translatedOptions[index] || baseValue;
+        const labelEl = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.name = perm.id;
+        input.value = baseValue;
+        input.setAttribute("data-option-id", id);
+        if (isOptionSelected(perm, id, baseValue)) input.checked = true;
+        labelEl.appendChild(input);
+        labelEl.append(" " + displayLabel);
+        block.appendChild(labelEl);
+      });
+    } else {
+      const selectedOptions = getSelectedByPosition(perm, selectedLang);
+      options.forEach((opt) => {
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.name = perm.id;
+        input.value = opt;
+        if (selectedOptions.includes(opt)) input.checked = true;
+        label.appendChild(input);
+        label.append(" " + opt);
+        block.appendChild(label);
+      });
+    }
+  }
 
-              const labelEl = document.createElement("label");
-              const input = document.createElement("input");
+  if (perm.elementType === "RADIOBUTTON" && enableRadioButtons) {
+    if (Object.keys(optionMap).length > 0) {
+      const mapEntries = Object.entries(optionMap);
+      const translatedOptions = tr?.options || perm.options || [];
+      mapEntries.forEach(([id, baseValue], index) => {
+        const displayLabel = translatedOptions[index] || baseValue;
+        const labelEl = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = perm.id;
+        input.value = baseValue;
+        input.setAttribute("data-option-id", id);
+        if (isOptionSelected(perm, id, baseValue)) input.checked = true;
+        labelEl.appendChild(input);
+        labelEl.append(" " + displayLabel);
+        block.appendChild(labelEl);
+      });
+    } else {
+      const selectedOptions = getSelectedByPosition(perm, selectedLang);
+      options.forEach((opt) => {
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = perm.id;
+        input.value = opt;
+        if (selectedOptions.includes(opt)) input.checked = true;
+        label.appendChild(input);
+        label.append(" " + opt);
+        block.appendChild(label);
+      });
+    }
+  }
 
-              input.type = "radio";
-              input.name = perm.id;
-              input.value = baseLabel;
-              input.setAttribute("data-option-id", id);
+  if (perm.elementType === "DROPDOWN" && enableDropdowns) {
+    const optionEntries = Object.keys(optionMap).length > 0
+      ? Object.entries(optionMap).map(([id, baseValue], index) => ({
+          id,
+          baseValue,
+          label: (tr?.options || perm.options || [])[index] || baseValue
+        }))
+      : options.map((opt, idx) => ({ id: idx.toString(), baseValue: opt, label: opt }));
 
-              labelEl.appendChild(input);
-              labelEl.append(" " + label);
+    if (perm.allowMultipleSelection) {
+      const msDropdown = document.createElement("div");
+      msDropdown.className = "ms-dropdown";
+      msDropdown.setAttribute("data-perm-id", perm.id);
 
-              block.appendChild(labelEl);
-            });
-        } else {
-          options.forEach((opt, idx) => {
-            const labelEl = document.createElement("label");
-            const input = document.createElement("input");
-            input.type = "radio";
-            input.name = perm.id;
-            input.value = opt;
-            input.setAttribute("data-option-id", idx.toString());
-            labelEl.appendChild(input);
-            labelEl.append(" " + opt);
-            block.appendChild(labelEl);
-          });
-        }
-      }
+      const control = document.createElement("div");
+      control.className = "ms-control";
+      control.tabIndex = 0;
 
+      const chips = document.createElement("div");
+      chips.className = "ms-chips";
 
-      if (perm.elementType === 'DROPDOWN' && enableDropdowns) {
-        const optionEntries = hasOptionMap
-          ? Object.entries(optionMap).map(([id, baseLabel], index) => ({
-              id,
-              baseLabel,
-              label: (tr?.options || [])[index] || baseLabel
-            }))
-          : options.map((opt, idx) => ({ id: idx.toString(), baseLabel: opt, label: opt }));
+      const placeholder = document.createElement("span");
+      placeholder.className = "ms-placeholder";
+      placeholder.textContent = "Select Options";
 
-        if (perm.allowMultipleSelection) {
-          const msDropdown = document.createElement("div");
-          msDropdown.className = "ms-dropdown";
-          msDropdown.setAttribute("data-perm-id", perm.id);
+      const arrow = document.createElement("span");
+      arrow.className = "ms-arrow";
+      arrow.textContent = "▾";
 
-          const control = document.createElement("div");
-          control.className = "ms-control";
-          control.tabIndex = 0;
+      const clearAll = document.createElement("span");
+      clearAll.className = "ms-clear-all";
+      clearAll.textContent = "✕";
+      clearAll.setAttribute("aria-label", "Clear all selected options");
+      clearAll.addEventListener("click", (e) => {
+        e.stopPropagation();
+        panel.querySelectorAll('input[type="checkbox"]:checked').forEach(cb => {
+          cb.checked = false;
+        });
+        refreshChips();
+        onSelectionChange(selectedLang);
+      });
 
-          const chips = document.createElement("div");
-          chips.className = "ms-chips";
+      control.appendChild(chips);
+      control.appendChild(placeholder);
+      control.appendChild(clearAll);
+      control.appendChild(arrow);
 
-          const placeholder = document.createElement("span");
-          placeholder.className = "ms-placeholder";
-          placeholder.textContent = "Select Options";
+      const panel = document.createElement("div");
+      panel.className = "ms-panel";
+      panel.style.display = "none";
 
-          const arrow = document.createElement("span");
-          arrow.className = "ms-arrow";
-          arrow.textContent = "▾";
+      const refreshChips = () => {
+        chips.innerHTML = "";
+        const checkedBoxes = panel.querySelectorAll('input[type="checkbox"]:checked');
+        checkedBoxes.forEach(cb => {
+          const chip = document.createElement("span");
+          chip.className = "ms-chip";
 
-          const clearAll = document.createElement("span");
-          clearAll.className = "ms-clear-all";
-          clearAll.textContent = "✕";
-          clearAll.title = "Clear all";
-          clearAll.addEventListener("click", (e) => {
+          const label = document.createElement("span");
+          label.textContent = cb.getAttribute("data-label") || cb.value;
+          chip.appendChild(label);
+
+          const remove = document.createElement("span");
+          remove.className = "ms-chip-remove";
+          remove.textContent = "✕";
+          remove.addEventListener("click", (e) => {
             e.stopPropagation();
-            panel.querySelectorAll('input[type="checkbox"]:checked').forEach(cb => {
-              cb.checked = false;
-              cb.closest(".ms-option")?.classList.remove("ms-option-selected");
-            });
+            cb.checked = false;
             refreshChips();
             onSelectionChange(selectedLang);
           });
+          chip.appendChild(remove);
 
-          control.appendChild(chips);
-          control.appendChild(placeholder);
-          control.appendChild(clearAll);
-          control.appendChild(arrow);
+          chips.appendChild(chip);
+        });
+        placeholder.style.display = checkedBoxes.length ? "none" : "inline";
+        control.classList.toggle("has-selection", checkedBoxes.length > 0);
+      };
 
-          const panel = document.createElement("div");
-          panel.className = "ms-panel";
-          panel.style.display = "none";
+      optionEntries.forEach(entry => {
+        const optionLabel = document.createElement("label");
+        optionLabel.className = "ms-option";
 
-          const refreshChips = () => {
-            chips.innerHTML = "";
-            const checkedBoxes = panel.querySelectorAll('input[type="checkbox"]:checked');
-            checkedBoxes.forEach(cb => {
-              const chip = document.createElement("span");
-              chip.className = "ms-chip";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.value = entry.baseValue;
+        checkbox.setAttribute("data-option-id", entry.id);
+        checkbox.setAttribute("data-label", entry.label);
 
-              const label = document.createElement("span");
-              label.textContent = cb.getAttribute("data-label") || cb.value;
-              chip.appendChild(label);
-
-              const remove = document.createElement("span");
-              remove.className = "ms-chip-remove";
-              remove.textContent = "✕";
-              remove.addEventListener("click", (e) => {
-                e.stopPropagation();
-                cb.checked = false;
-                refreshChips();
-                onSelectionChange(selectedLang);
-              });
-              chip.appendChild(remove);
-
-              chips.appendChild(chip);
-            });
-            placeholder.style.display = checkedBoxes.length ? "none" : "inline";
-            control.classList.toggle("has-selection", checkedBoxes.length > 0);
-          };
-
-          optionEntries.forEach(entry => {
-            const optionLabel = document.createElement("label");
-            optionLabel.className = "ms-option";
-
-            const checkbox = document.createElement("input");
-            checkbox.type = "checkbox";
-            checkbox.value = entry.baseLabel;
-            checkbox.setAttribute("data-option-id", entry.id);
-            checkbox.setAttribute("data-label", entry.label);
-
-            checkbox.addEventListener("change", () => {
-              optionLabel.classList.toggle("ms-option-selected", checkbox.checked);
-              refreshChips();
-              // Close panel after selection (mirror single-select behaviour)
-              panel.style.display = "none";
-              control.classList.remove("open");
-              // onSelectionChange handled once by the generic block binding
-            });
-
-            optionLabel.appendChild(checkbox);
-            optionLabel.append(" " + entry.label);
-            panel.appendChild(optionLabel);
-          });
-
-          control.addEventListener("click", (e) => {
-            e.stopPropagation();
-            const isOpen = panel.style.display === "block";
-            document.querySelectorAll(".ms-panel").forEach(p => p.style.display = "none");
-            document.querySelectorAll(".ms-control").forEach(c => c.classList.remove("open"));
-            panel.style.display = isOpen ? "none" : "block";
-            control.classList.toggle("open", !isOpen);
-          });
-
-          msDropdown.appendChild(control);
-          msDropdown.appendChild(panel);
-          refreshChips();
-          block.appendChild(msDropdown);
-        } else {
-          // Single-select custom dropdown (shares multiselect panel styling)
-          const ssDropdown = document.createElement("div");
-          ssDropdown.className = "ms-dropdown";
-          ssDropdown.setAttribute("data-perm-id", perm.id);
-
-          // Hidden native select keeps existing data-collection + validation working
-          const select = document.createElement("select");
-          select.name = perm.id;
-          select.style.display = "none";
-
-          const defaultOption = document.createElement("option");
-          defaultOption.value = "";
-          defaultOption.text = "Select Option";
-          defaultOption.selected = true;
-          defaultOption.disabled = true;
-          select.appendChild(defaultOption);
-
-          optionEntries.forEach(entry => {
-            const option = document.createElement("option");
-            option.value = entry.baseLabel;
-            option.text = entry.label;
-            option.setAttribute("data-option-id", entry.id);
-            select.appendChild(option);
-          });
-
-          const control = document.createElement("div");
-          control.className = "ms-control";
-          control.tabIndex = 0;
-
-          const valueText = document.createElement("span");
-          valueText.className = "ms-chips";
-
-          const placeholder = document.createElement("span");
-          placeholder.className = "ms-placeholder";
-          placeholder.textContent = "Select Option";
-
-          const arrow = document.createElement("span");
-          arrow.className = "ms-arrow";
-          arrow.textContent = "▾";
-
-          control.appendChild(valueText);
-          control.appendChild(placeholder);
-          control.appendChild(arrow);
-
-          const panel = document.createElement("div");
-          panel.className = "ms-panel";
-          panel.style.display = "none";
-
-          optionEntries.forEach(entry => {
-            const optionLabel = document.createElement("label");
-            optionLabel.className = "ms-option";
-            optionLabel.textContent = entry.label;
-
-            optionLabel.addEventListener("click", (e) => {
-              e.stopPropagation();
-              select.value = entry.baseLabel;
-
-              valueText.textContent = entry.label;
-              placeholder.style.display = "none";
-
-              panel.querySelectorAll(".ms-option").forEach(o => o.classList.remove("ms-option-selected"));
-              optionLabel.classList.add("ms-option-selected");
-
-              panel.style.display = "none";
-              control.classList.remove("open");
-
-              onSelectionChange(selectedLang);
-            });
-
-            panel.appendChild(optionLabel);
-          });
-
-          control.addEventListener("click", (e) => {
-            e.stopPropagation();
-            const isOpen = panel.style.display === "block";
-            document.querySelectorAll(".ms-panel").forEach(p => p.style.display = "none");
-            document.querySelectorAll(".ms-control").forEach(c => c.classList.remove("open"));
-            panel.style.display = isOpen ? "none" : "block";
-            control.classList.toggle("open", !isOpen);
-          });
-
-          ssDropdown.appendChild(select);
-          ssDropdown.appendChild(control);
-          ssDropdown.appendChild(panel);
-          block.appendChild(ssDropdown);
+        // Pre-check based on existing preference data (edit/reload case)
+        if (isOptionSelected(perm, entry.id, entry.baseValue)) {
+          checkbox.checked = true;
         }
-      }
 
-      block.querySelectorAll("input, select").forEach(function(el) {
-        el.addEventListener("change", function() { onSelectionChange(selectedLang); });
+        checkbox.addEventListener("change", () => {
+          optionLabel.classList.toggle("ms-option-selected", checkbox.checked);
+          refreshChips();
+          panel.style.display = "none";
+          control.classList.remove("open");
+          onSelectionChange(selectedLang);
+        });
+
+        optionLabel.appendChild(checkbox);
+        optionLabel.append(" " + entry.label);
+        panel.appendChild(optionLabel);
       });
-      root.appendChild(block);
-    });
 
+      control.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const isOpen = panel.style.display === "block";
+        document.querySelectorAll(".ms-panel").forEach(p => p.style.display = "none");
+        document.querySelectorAll(".ms-control").forEach(c => c.classList.remove("open"));
+        panel.style.display = isOpen ? "none" : "block";
+        control.classList.toggle("open", !isOpen);
+      });
 
+      msDropdown.appendChild(control);
+      msDropdown.appendChild(panel);
+      refreshChips(); // reflect pre-checked boxes as chips immediately
+      block.appendChild(msDropdown);
+    } else {
+        // Single-select custom dropdown (shares multiselect panel styling)
+        const ssDropdown = document.createElement("div");
+        ssDropdown.className = "ms-dropdown";
+        ssDropdown.setAttribute("data-perm-id", perm.id);
+
+        // Hidden native select keeps existing data-collection + validation working
+        const select = document.createElement("select");
+        select.name = perm.id;
+        select.style.display = "none";
+
+        const defaultOption = document.createElement("option");
+        defaultOption.value = "";
+        defaultOption.text = "Select options";
+        defaultOption.selected = true;
+        defaultOption.disabled = true;
+        select.appendChild(defaultOption);
+
+        optionEntries.forEach(entry => {
+          const option = document.createElement("option");
+          option.value = entry.baseValue;
+          option.text = entry.label;
+          option.setAttribute("data-option-id", entry.id);
+          select.appendChild(option);
+        });
+
+        const control = document.createElement("div");
+        control.className = "ms-control";
+        control.tabIndex = 0;
+
+        const valueText = document.createElement("span");
+        valueText.className = "ms-chips ss-value";
+
+        const placeholder = document.createElement("span");
+        placeholder.className = "ms-placeholder";
+        placeholder.textContent = "Select Options";
+
+        const arrow = document.createElement("span");
+        arrow.className = "ms-arrow";
+        arrow.textContent = "▾";
+
+        control.appendChild(valueText);
+        control.appendChild(placeholder);
+        control.appendChild(arrow);
+
+        const panel = document.createElement("div");
+        panel.className = "ms-panel";
+        panel.style.display = "none";
+
+        optionEntries.forEach(entry => {
+          const optionLabel = document.createElement("label");
+          optionLabel.className = "ms-option";
+          optionLabel.textContent = entry.label;
+
+          // Pre-select based on existing preference data (edit/reload case)
+          if (isOptionSelected(perm, entry.id, entry.baseValue)) {
+            select.value = entry.baseValue;
+            valueText.textContent = entry.label;
+            placeholder.style.display = "none";
+            optionLabel.classList.add("ms-option-selected");
+          }
+
+          optionLabel.addEventListener("click", (e) => {
+            e.stopPropagation();
+            select.value = entry.baseValue;
+
+            valueText.textContent = entry.label;
+            placeholder.style.display = "none";
+
+            panel.querySelectorAll(".ms-option").forEach(o => o.classList.remove("ms-option-selected"));
+            optionLabel.classList.add("ms-option-selected");
+
+            panel.style.display = "none";
+            control.classList.remove("open");
+
+            onSelectionChange(selectedLang);
+          });
+
+          panel.appendChild(optionLabel);
+        });
+
+        control.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const isOpen = panel.style.display === "block";
+          document.querySelectorAll(".ms-panel").forEach(p => p.style.display = "none");
+          document.querySelectorAll(".ms-control").forEach(c => c.classList.remove("open"));
+          panel.style.display = isOpen ? "none" : "block";
+          control.classList.toggle("open", !isOpen);
+        });
+
+        ssDropdown.appendChild(select);
+        ssDropdown.appendChild(control);
+        ssDropdown.appendChild(panel);
+        block.appendChild(ssDropdown);
+      }
+  }
+
+  block.querySelectorAll("input, select").forEach(function(el) {
+    if (el.closest(".ms-dropdown")) return; // ms-dropdown fires onSelectionChange directly
+    el.addEventListener("change", function() { onSelectionChange(selectedLang); });
+  });
+
+  const statementError = document.createElement("div");
+  statementError.className = "error-message statement-error";
+  statementError.style.display = "none";
+  block.appendChild(statementError);
+
+  root.appendChild(block);
+});
+
+ 
 
   const cancelBtn = document.getElementById("cancelBtn");
   const submitBtn = document.getElementById("submitBtn");
-  const selectedLanguage = selectedLang?.toLowerCase();
 
-  const translatedBranding = branding.brandingTranslation?.find(
-    b => b.language?.toLowerCase() === selectedLanguage
-  );
+  const selectedLanguage = selectedLang?.toLowerCase();
+  const translatedBranding =
+    branding.brandingTranslation?.find(
+      (b) => b.language?.toLowerCase() === selectedLanguage
+    );
 
   const submitLabel =
-    translatedBranding?.primaryButtonLabel || branding.primaryButtonLabel || "Submit";
+    translatedBranding?.primaryButtonLabel ||
+    branding.primaryButtonLabel ||
+    "Submit";
   const cancelLabel =
-    translatedBranding?.secondaryButtonLabel || branding.secondaryButtonLabel || "Cancel";
+    translatedBranding?.secondaryButtonLabel ||
+    branding.secondaryButtonLabel ||
+    "Cancel";
 
   if (showButtons) {
     cancelBtn.style.display = "block";
@@ -1155,101 +1334,354 @@ langSelect.onchange = async () => {
 
     submitBtn.style.display = "block";
     submitBtn.innerText = submitLabel;
-    submitBtn.disabled = true; // disabled until SSS verification succeeds
-    if (branding.primaryButtonbgColor) submitBtn.style.backgroundColor = branding.primaryButtonbgColor;
-    if (branding.primaryFontColor) submitBtn.style.color = branding.primaryFontColor;
-    if (branding.primaryButtonborderColor) submitBtn.style.borderColor = branding.primaryButtonborderColor;
-    if (branding.primaryFontSize) submitBtn.style.fontSize = branding.primaryFontSize;
+    submitBtn.disabled = !isSSSValid;
 
-    if (branding.secondaryButtonBgColor) cancelBtn.style.backgroundColor = branding.secondaryButtonBgColor;
-    if (branding.secondaryFontColor) cancelBtn.style.color = branding.secondaryFontColor;
-    if (branding.secondaryButtonBorderColor) cancelBtn.style.borderColor = branding.secondaryButtonBorderColor;
-    if (branding.secondaryFontSize) cancelBtn.style.fontSize = branding.secondaryFontSize;
+      submitBtn.style.backgroundColor =
+        branding.primaryButtonbgColor;
+    if (branding.primaryFontColor)
+      submitBtn.style.color = branding.primaryFontColor;
+    if (branding.primaryButtonborderColor)
+      submitBtn.style.borderColor =
+        branding.primaryButtonborderColor;
+    if (branding.primaryFontSize)
+      submitBtn.style.fontSize = branding.primaryFontSize;
+    if (branding.primaryFontStyle) {
+      submitBtn.style.fontStyle =
+        branding.primaryFontStyle;
+      submitBtn.style.fontWeight =
+        branding.primaryFontStyle;
+    }
 
-    const buttonGroup = document.getElementById("button-group");
+    if (branding.secondaryButtonBgColor)
+      cancelBtn.style.backgroundColor =
+        branding.secondaryButtonBgColor;
+    if (branding.secondaryFontColor)
+      cancelBtn.style.color =
+        branding.secondaryFontColor;
+    if (branding.secondaryButtonBorderColor)
+      cancelBtn.style.borderColor =
+        branding.secondaryButtonBorderColor;
+    if (branding.secondaryFontSize)
+      cancelBtn.style.fontSize =
+        branding.secondaryFontSize;
+    if (branding.secondaryFontStyle) {
+      cancelBtn.style.fontStyle =
+        branding.secondaryFontStyle;
+      cancelBtn.style.fontWeight =
+        branding.secondaryFontStyle;
+    }
+
+    const buttonGroup =
+      document.getElementById("button-group");
+    const buttonFooterAlignment =
+      data.currentPreference.branding?.footerAlignment ||
+      footerAlignment;
+
     buttonGroup.classList.remove("left", "center", "right");
-    const footerAlign = branding.footerAlignment || "left";
-    buttonGroup.classList.add(footerAlign.toLowerCase());
+
+    if (buttonFooterAlignment === "center") {
+      buttonGroup.classList.add("center");
+    } else if (buttonFooterAlignment === "right") {
+      buttonGroup.classList.add("right");
+    } else {
+      buttonGroup.classList.add("left");
+    }
   } else {
     cancelBtn.style.display = "none";
     submitBtn.style.display = "none";
   }
 
-  submitBtn.removeEventListener("click", clickEvent);
+  
 
 clickEvent = async (e) => {
     if (e) {
         e.preventDefault();
     }
 
-    document.querySelectorAll(".error-message").forEach(el => el.remove());
-    document.querySelectorAll(".error-border").forEach(el => el.classList.remove("error-border"));
+    errorDiv.innerHTML = "";
+    root.querySelectorAll(".statement-error").forEach((el) => {
+      el.textContent = "";
+      el.style.display = "none";
+    });
+    root.querySelectorAll(".error-border").forEach((el) => {
+      el.classList.remove("error-border");
+    });
 
     let isValid = true;
 
-    permissions.forEach(perm => {
-        if (!perm.mandatory) return;
+    permissions.forEach((perm) => {
+        if (isMandatoryField(perm)) {
+            const name = perm.id;
+            let hasValue = false;
 
-        const name = perm.id;
-        let hasValue = false;
-
-        if (perm.elementType === "CHECKBOX" || perm.elementType === "RADIOBUTTON") {
-            const inputs = document.querySelectorAll(`input[name="${name}"]:checked`);
-            if (inputs.length > 0) hasValue = true;
-        }
-
-        if (perm.elementType === "DROPDOWN") {
-          if (perm.allowMultipleSelection) {
-            const checked = document.querySelectorAll(`.ms-dropdown[data-perm-id="${name}"] input[type="checkbox"]:checked`);
-            if (checked.length > 0) hasValue = true;
-          } else {
-            const select = document.querySelector(`select[name="${name}"]`);
-            if (select && select.value) hasValue = true;
-          }
-        }
-
-        if (!hasValue) {
-            isValid = false;
-
-            const block = Array.from(document.querySelectorAll(".permission-block"))
-                .find(div => div.querySelector(`[data-translate-text="${name}"]`));
-
-            if (block) {
-                const error = document.createElement("div");
-                error.className = "error-message";
-                error.textContent = "This field is required.";
-                block.appendChild(error);
-
-                block.querySelectorAll("input, select").forEach(el =>
-                    el.classList.add("error-border")
+            if (
+                perm.elementType === "CHECKBOX" ||
+                perm.elementType === "RADIOBUTTON"
+            ) {
+                const inputs = root.querySelectorAll(
+                    `input[name="${name}"]:checked`
                 );
-
-                const msControl = block.querySelector(`.ms-dropdown[data-perm-id="${name}"] .ms-control`);
-                if (msControl) {
-                  msControl.classList.add("error-border");
+                if (inputs.length > 0) hasValue = true;
+            } else if (perm.elementType === "DROPDOWN") {
+                if (perm.allowMultipleSelection) {
+                    const msEl = root.querySelector(`[data-perm-id="${name}"]`);
+                    if (msEl && msEl.querySelectorAll('input[type="checkbox"]:checked').length > 0) hasValue = true;
+                } else {
+                    const select = root.querySelector(`select[name="${name}"]`);
+                    if (select && select.value) hasValue = true;
                 }
+            }
+
+            if (!hasValue) {
+                isValid = false;
+
+              const statementError = root.querySelector(
+                `.permission-block[data-permission-id="${name}"] .statement-error`
+              );
+              if (statementError) {
+                statementError.textContent = "This field is required.";
+                statementError.style.display = "block";
+              }
+
+                root.querySelectorAll(`[name="${name}"]`)
+                    .forEach(el => el.classList.add("error-border"));
+              root.querySelectorAll(`.ms-dropdown[data-perm-id="${name}"] .ms-control`)
+                .forEach(el => el.classList.add("error-border"));
             }
         }
     });
 
     if (!isValid) {
-        showToast("Please fill all mandatory fields", "error");
-        return;
+      showToast("Please fill all mandatory fields", "error");
+      return;
     }
 
-    const finalPayload = buildFinalConsentRequest(selectedLang);
-    createConsentRequestList = finalPayload.createConsentRequestDtoWrapper;
+    const payload = buildFinalConsentRequest(selectedLanguage);
+    createConsentRequestList = payload.createConsentRequestDtoWrapper;
 
     return await sendConsent();
 };
 
-submitBtn.addEventListener("click", clickEvent);
+submitBtn.onclick = clickEvent;
 
-cancelBtn.onclick = () => {
-  resetWidget(false);
+cancelBtn.onclick = async () => {
+  if (window.preferenceData?.currentPreference) {
+    // Reset form to original state
+    renderConsent(window.preferenceData, selectedLanguage);
+
+    // Clear previous signature state
+    globalSSS = null;
+    isSSSValid = false;
+
+    const submitBtn = document.getElementById("submitBtn");
+    if (submitBtn) {
+      submitBtn.disabled = true;
+    }
+
+    // Generate fresh BSS + SSS for restored selections
+    await onSelectionChange(selectedLanguage);
+  }
 };
+}
+
+function switchToCurrent() {
+  document
+    .getElementById("consent-root")
+    .classList.remove("hidden");
+  document
+    .getElementById("historyTab")
+    .classList.add("hidden");
+
+  document
+    .getElementById("tab-current")
+    .classList.add("active");
+  document
+    .getElementById("tab-history")
+    .classList.remove("active");
+
+  document.getElementById("logo-area").style.display =
+    "block";
+  toggleFooterButtons(true);
+
+    if (window.preferenceData?.currentPreference) {
+    renderConsent(window.preferenceData, selectedLanguage);
+  }
+}
+
+function switchToHistory() {
+  document
+    .getElementById("consent-root")
+    .classList.add("hidden");
+  document
+    .getElementById("historyTab")
+    .classList.remove("hidden");
+
+  document
+    .getElementById("tab-current")
+    .classList.remove("active");
+  document
+    .getElementById("tab-history")
+    .classList.add("active");
+	
+  
+
+  document.getElementById("logo-area").style.display =
+    "none";
+  toggleFooterButtons(false);
+
+if (window.preferenceHistory) {
+  renderHistory(window.preferenceHistory, selectedLanguage);
+}
+  attachHistoryScroll();
 
 }
+
+function handlePreferenceView(view) {
+  const tabs = document.getElementById("pc-tabs");
+  const tabCurrent = document.getElementById("tab-current");
+  const tabHistory = document.getElementById("tab-history");
+
+  tabs.classList.add("d-none");
+
+  if (view === "CURRENT_PREFERENCE") {
+    tabs.classList.remove("d-none");
+    tabHistory.style.display = "none";
+    tabCurrent.style.display = "block";
+    tabCurrent.classList.remove("pc-tab");
+    tabCurrent.style.fontWeight = "bold"; 
+    switchToCurrent();
+  }
+
+  if (view === "PREFERENCE_HISTORY") {
+    tabs.classList.remove("d-none");
+    tabCurrent.style.display = "none";
+    tabHistory.style.display = "block";
+    tabHistory.classList.remove("pc-tab");
+    tabHistory.style.fontWeight = "bold"; 
+    switchToHistory();
+  }
+
+  if (view === "BOTH") {
+    tabs.classList.remove("d-none");
+    tabCurrent.style.display = "block";
+    tabHistory.style.display = "block";
+    switchToCurrent();
+  }
+}
+
+function toggleFooterButtons(show) {
+  const cancelBtn = document.getElementById("cancelBtn");
+  const submitBtn = document.getElementById("submitBtn");
+  const footer = document.getElementById("button-group");
+  const footerBorder = document.getElementById("full-width-footer-border");
+  
+  if (!show) {
+    cancelBtn.style.display = "none";
+    submitBtn.style.display = "none";
+    footer.style.display = "none";
+    footerBorder.classList.add("hidden"); 
+  } else {
+    footer.style.display = "flex";
+    cancelBtn.style.display = "block";
+    submitBtn.style.display = "block";
+    footerBorder.classList.remove("hidden");
+  }
+  
+}
+
+function renderHistory(historyDto, selectedLang = "en") {
+  const historyRoot = document.getElementById("historyTab");
+  historyRoot.innerHTML = "";
+  historyRoot.classList.add("history-scroll");
+
+  if (!historyDto || Object.keys(historyDto).length === 0) {
+    historyRoot.innerHTML = "<p>No preference history available.</p>";
+    return;
+  }
+
+  Object.keys(historyDto)
+    .sort((a, b) => new Date(b) - new Date(a))
+    .forEach((timestamp) => {
+      const record = document.createElement("div");
+      record.className = "history-record";
+
+      
+      const dateHeader = document.createElement("div");
+      dateHeader.className = "history-date";
+      const date = new Date(timestamp);
+      const datePart = date.toLocaleDateString("en-US", {
+        month: "short",
+        day: "2-digit",
+        year: "numeric",
+      });
+
+const timePart = date.toLocaleTimeString("en-GB", {
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
+});
+
+const icon = document.createElement("i");
+icon.className = "ri-calendar-2-line me-2 fs-5 big-icon";
+
+
+dateHeader.innerHTML = "";
+dateHeader.appendChild(icon);
+dateHeader.append(" ", datePart, " | ", timePart);
+
+      record.appendChild(dateHeader);
+
+const row = document.createElement("div");
+  historyDto[timestamp].forEach(item => {
+    const line = document.createElement("div");
+    line.className = "history-row";
+const tempDiv = document.createElement("div");
+tempDiv.innerHTML = item.permission || "";
+
+const children = Array.from(tempDiv.children);
+
+const optedText = item.optedFor?.length
+  ? item.optedFor
+      .map(opt => opt.charAt(0).toUpperCase() + opt.slice(1))
+      .join(", ")
+  : "No selection";
+
+if (children.length > 0) {
+  children.forEach((child, index) => {
+    const cloned = document.createElement(child.tagName.toLowerCase());
+    cloned.innerHTML = child.innerHTML;
+
+    cloned.style.display = "block";
+    cloned.style.margin = "2px 0";
+    cloned.style.lineHeight = "1.4";
+
+    if (child.getAttribute("style")) {
+      cloned.setAttribute("style", child.getAttribute("style"));
+    }
+
+    if (index === children.length - 1) {
+      cloned.innerHTML += ` : <span class="value">${optedText}</span>`;
+    }
+
+    line.appendChild(cloned);
+  });
+} else {
+  line.innerHTML = `${item.permission} : <span class="value">${optedText}</span>`;
+}
+    row.appendChild(line);
+  });
+
+  record.appendChild(row);
+  historyRoot.appendChild(record);
+    });
+}
+
+
+
+
+document.getElementById("tab-current").addEventListener("click", switchToCurrent);
+document.getElementById("tab-history").addEventListener("click", switchToHistory);
 
 function decodeJwt(token) {
   const base64Url = token.split('.')[1];
@@ -1264,6 +1696,8 @@ function decodeJwt(token) {
 
   return JSON.parse(jsonPayload);
 }
+
+
 
 async function submitConsent() {
   return await sendConsent();
@@ -1280,15 +1714,34 @@ function getConsentState() {
     sss: globalSSS
   };
 }
+async function resetWidget() {
+  if (window.preferenceData?.currentPreference) {
+    // Restore original state
+    renderConsent(window.preferenceData, selectedLanguage);
+
+    // Clear old signature
+    globalSSS = null;
+    isSSSValid = false;
+
+    const submitBtn = document.getElementById("submitBtn");
+    if (submitBtn) {
+      submitBtn.disabled = true;
+    }
+
+    // Generate fresh BSS + SSS
+    await onSelectionChange(selectedLanguage);
+  }
+}
 
 window.consentWidget = {
     submit: async () => {
         return await clickEvent();
     },
 
-    reset: () => {
-        return resetWidget();
+    reset: async () => {
+        return await resetWidget();
     }
 };
 
 initSigningKey().then(fetchConsentData);
+
